@@ -1,0 +1,437 @@
+name: Security Scan Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      infra_directory:
+        description: 'Path to terraform/infra code'
+        required: false
+        type: string
+        default: 'infra'
+      source_directory:
+        description: 'Path to application source code'
+        required: false
+        type: string
+        default: '.'
+      enable_iac_scan:
+        description: 'Run IaC security scanning (tfsec, checkov, KICS)'
+        required: false
+        type: boolean
+        default: true
+      enable_secret_scan:
+        description: 'Run secret detection (gitleaks, trufflehog)'
+        required: false
+        type: boolean
+        default: true
+      enable_dependency_scan:
+        description: 'Run dependency vulnerability scan'
+        required: false
+        type: boolean
+        default: true
+      enable_sast:
+        description: 'Run static application security testing (Semgrep)'
+        required: false
+        type: boolean
+        default: true
+      enable_container_scan:
+        description: 'Run container image vulnerability scan (Trivy)'
+        required: false
+        type: boolean
+        default: false
+      container_image:
+        description: 'Container image to scan (required if enable_container_scan is true)'
+        required: false
+        type: string
+        default: ''
+      severity_threshold:
+        description: 'Minimum severity to fail (LOW, MEDIUM, HIGH, CRITICAL)'
+        required: false
+        type: string
+        default: 'HIGH'
+      fail_on_findings:
+        description: 'Fail the pipeline if findings exceed threshold'
+        required: false
+        type: boolean
+        default: true
+      upload_sarif:
+        description: 'Upload SARIF results to GitHub Security tab'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+
+  iac-scan:
+    name: IaC Security Scan
+    if: inputs.enable_iac_scan
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        id: tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ inputs.infra_directory }}
+          format: sarif
+          out: tfsec-results.sarif
+          soft_fail: true
+
+      - name: Run checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ inputs.infra_directory }}
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+          framework: terraform
+
+      - name: Run KICS
+        id: kics
+        uses: checkmarx/kics-github-action@v2.1.3
+        with:
+          path: ${{ inputs.infra_directory }}
+          output_path: kics-results
+          output_formats: sarif,json
+          fail_on: ${{ inputs.severity_threshold == 'CRITICAL' && 'critical' || inputs.severity_threshold == 'HIGH' && 'high,critical' || 'medium,high,critical' }}
+          enable_comments: true
+        continue-on-error: true
+
+      - name: Upload tfsec SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+        continue-on-error: true
+
+      - name: Upload checkov SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+        continue-on-error: true
+
+      - name: Upload KICS SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: kics-results/results.sarif
+          category: kics
+        continue-on-error: true
+
+      - name: IaC scan summary
+        if: always()
+        run: |
+          echo "## IaC Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **tfsec** | \`${{ steps.tfsec.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **checkov** | \`${{ steps.checkov.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **KICS** | \`${{ steps.kics.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Scanned directory: \`${{ inputs.infra_directory }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload scan artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-results
+          path: |
+            tfsec-results.sarif
+            checkov-results.sarif
+            kics-results/
+          retention-days: 30
+
+  secret-scan:
+    name: Secret Detection
+    if: inputs.enable_secret_scan
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Run trufflehog
+        id: trufflehog
+        uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --only-verified --results=verified
+        continue-on-error: true
+
+      - name: Secret scan summary
+        if: always()
+        run: |
+          echo "## Secret Detection Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **gitleaks** | \`${{ steps.gitleaks.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **trufflehog** | \`${{ steps.trufflehog.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail on secrets found
+        if: inputs.fail_on_findings && (steps.gitleaks.outcome == 'failure' || steps.trufflehog.outcome == 'failure')
+        run: |
+          echo "BLOCKED: Secrets detected in codebase"
+          exit 1
+
+  dependency-scan:
+    name: Dependency Scan
+    if: inputs.enable_dependency_scan
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Trivy filesystem scan
+        id: trivy_fs
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ inputs.source_directory }}
+          format: sarif
+          output: trivy-dependency-results.sarif
+          severity: ${{ inputs.severity_threshold }},CRITICAL
+          exit-code: 0
+
+      - name: Upload Trivy SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-dependency-results.sarif
+          category: trivy-dependency
+        continue-on-error: true
+
+      - name: Run npm audit
+        id: npm_audit
+        if: hashFiles('package-lock.json') != ''
+        run: |
+          echo "## npm Audit Results" >> $GITHUB_STEP_SUMMARY
+          npm audit --omit=dev --json > npm-audit.json 2>&1 || true
+          VULNS=$(jq '.metadata.vulnerabilities | to_entries | map(select(.value > 0)) | map("\(.key): \(.value)") | join(", ")' npm-audit.json -r 2>/dev/null || echo "unknown")
+          echo "Vulnerabilities: **$VULNS**" >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Run dotnet audit
+        id: dotnet_audit
+        if: hashFiles('**/*.csproj') != ''
+        run: |
+          echo "## .NET Vulnerability Check" >> $GITHUB_STEP_SUMMARY
+          dotnet list package --vulnerable --format json > dotnet-audit.json 2>&1 || true
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          cat dotnet-audit.json >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        continue-on-error: true
+
+      - name: Dependency scan summary
+        if: always()
+        run: |
+          echo "## Dependency Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trivy FS** | \`${{ steps.trivy_fs.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **npm audit** | \`${{ steps.npm_audit.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **dotnet audit** | \`${{ steps.dotnet_audit.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload dependency artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-results
+          path: |
+            trivy-dependency-results.sarif
+            npm-audit.json
+            dotnet-audit.json
+          retention-days: 30
+
+  sast:
+    name: SAST
+    if: inputs.enable_sast
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep
+        id: semgrep
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/default
+            p/javascript
+            p/typescript
+            p/csharp
+            p/terraform
+            p/secrets
+            p/owasp-top-ten
+          generateSarif: true
+        env:
+          SEMGREP_RULES: p/default p/owasp-top-ten
+        continue-on-error: true
+
+      - name: Upload Semgrep SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+        continue-on-error: true
+
+      - name: SAST summary
+        if: always()
+        run: |
+          echo "## SAST Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Semgrep** | \`${{ steps.semgrep.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Rule sets: default, javascript, typescript, csharp, terraform, secrets, owasp-top-ten" >> $GITHUB_STEP_SUMMARY
+
+  container-scan:
+    name: Container Image Scan
+    if: inputs.enable_container_scan && inputs.container_image != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run Trivy image scan
+        id: trivy_image
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.container_image }}
+          format: sarif
+          output: trivy-container-results.sarif
+          severity: ${{ inputs.severity_threshold }},CRITICAL
+          exit-code: ${{ inputs.fail_on_findings && '1' || '0' }}
+        continue-on-error: true
+
+      - name: Run Trivy table output
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ inputs.container_image }}
+          format: table
+          severity: ${{ inputs.severity_threshold }},CRITICAL
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF
+        if: inputs.upload_sarif && always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-container-results.sarif
+          category: trivy-container
+        continue-on-error: true
+
+      - name: Container scan summary
+        if: always()
+        run: |
+          echo "## Container Image Scan" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ inputs.container_image }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trivy** | \`${{ steps.trivy_image.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Severity** | \`${{ inputs.severity_threshold }}+\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload container scan artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-scan-results
+          path: trivy-container-results.sarif
+          retention-days: 30
+
+  summary:
+    name: Security Summary
+    if: always()
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    needs: [iac-scan, secret-scan, dependency-scan, sast, container-scan]
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **IaC Scan** (tfsec + checkov + KICS) | \`${{ needs.iac-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Secret Detection** (gitleaks + trufflehog) | \`${{ needs.secret-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Dependency Scan** (Trivy + npm/dotnet audit) | \`${{ needs.dependency-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SAST** (Semgrep) | \`${{ needs.sast.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Container Scan** (Trivy) | \`${{ needs.container-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Severity threshold** | \`${{ inputs.severity_threshold }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Fail on findings** | \`${{ inputs.fail_on_findings }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SARIF uploaded** | \`${{ inputs.upload_sarif }}\` |" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const results = {
+              'IaC Scan': '${{ needs.iac-scan.result }}',
+              'Secret Detection': '${{ needs.secret-scan.result }}',
+              'Dependency Scan': '${{ needs.dependency-scan.result }}',
+              'SAST': '${{ needs.sast.result }}',
+              'Container Scan': '${{ needs.container-scan.result }}'
+            };
+
+            const rows = Object.entries(results)
+              .map(([name, status]) => `| **${name}** | \`${status}\` |`)
+              .join('\n');
+
+            const failed = Object.values(results).some(s => s === 'failure');
+            const icon = failed ? 'FAILED' : 'PASSED';
+
+            const body = `## ${icon} Security Scan Results\n\n| Scan | Status |\n|------|--------|\n${rows}\n\n*Run:* [${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+        continue-on-error: true

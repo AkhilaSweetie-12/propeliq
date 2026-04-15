@@ -1,0 +1,341 @@
+name: PR Automation
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      enable_auto_label:
+        description: 'Auto-label PRs based on changed files'
+        required: false
+        type: boolean
+        default: true
+      enable_size_label:
+        description: 'Add size label (XS, S, M, L, XL) based on diff'
+        required: false
+        type: boolean
+        default: true
+      enable_conventional_title:
+        description: 'Enforce conventional commit PR titles'
+        required: false
+        type: boolean
+        default: true
+      enable_stale_check:
+        description: 'Mark and close stale PRs'
+        required: false
+        type: boolean
+        default: false
+      stale_days:
+        description: 'Days before marking a PR as stale'
+        required: false
+        type: number
+        default: 14
+      stale_close_days:
+        description: 'Days after stale label before auto-closing'
+        required: false
+        type: number
+        default: 7
+      required_labels:
+        description: 'Comma-separated labels required before merge'
+        required: false
+        type: string
+        default: ''
+      label_rules:
+        description: |
+          JSON map of label -> glob patterns for auto-labeling.
+          Example: {"infra": ["infra/**","terraform/**"], "ci": [".github/**"]}
+        required: false
+        type: string
+        default: '{"infra": ["infra/**","*.tf"], "ci": [".github/**"], "docs": ["**/*.md","docs/**"], "docker": ["**/Dockerfile","docker-compose*"]}'
+
+jobs:
+  auto-label:
+    name: Auto Label
+    if: inputs.enable_auto_label && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Label by changed files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const rules = JSON.parse('${{ inputs.label_rules }}');
+            const { data: files } = await github.rest.pulls.listFiles({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number,
+              per_page: 300
+            });
+
+            const changedFiles = files.map(f => f.filename);
+            const labelsToAdd = new Set();
+
+            for (const [label, patterns] of Object.entries(rules)) {
+              for (const pattern of patterns) {
+                const regex = new RegExp(
+                  '^' + pattern
+                    .replace(/\*\*/g, '.*')
+                    .replace(/\*/g, '[^/]*')
+                    .replace(/\?/g, '.') + '$'
+                );
+                if (changedFiles.some(f => regex.test(f))) {
+                  labelsToAdd.add(label);
+                  break;
+                }
+              }
+            }
+
+            if (labelsToAdd.size > 0) {
+              const labels = [...labelsToAdd];
+              console.log(`Adding labels: ${labels.join(', ')}`);
+
+              // Ensure labels exist
+              const { data: repoLabels } = await github.rest.issues.listLabelsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              });
+              const existingNames = repoLabels.map(l => l.name);
+
+              for (const label of labels) {
+                if (!existingNames.includes(label)) {
+                  await github.rest.issues.createLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: label,
+                    color: Math.floor(Math.random()*16777215).toString(16).padStart(6, '0')
+                  });
+                }
+              }
+
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels
+              });
+            }
+
+  size-label:
+    name: Size Label
+    if: inputs.enable_size_label && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Calculate PR size
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.issue.number
+            });
+
+            const changes = pr.additions + pr.deletions;
+            let size;
+            if (changes < 10)       size = 'size/XS';
+            else if (changes < 50)  size = 'size/S';
+            else if (changes < 200) size = 'size/M';
+            else if (changes < 500) size = 'size/L';
+            else                    size = 'size/XL';
+
+            const colors = {
+              'size/XS': '3cbf00', 'size/S': '5d9801',
+              'size/M': '7f7203', 'size/L': 'a14c05',
+              'size/XL': 'c32607'
+            };
+
+            // Remove existing size labels
+            const { data: currentLabels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+            for (const label of currentLabels) {
+              if (label.name.startsWith('size/')) {
+                await github.rest.issues.removeLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  name: label.name
+                });
+              }
+            }
+
+            // Ensure label exists
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: size
+              });
+            } catch {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: size,
+                color: colors[size]
+              });
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: [size]
+            });
+
+            console.log(`PR size: ${changes} changes -> ${size}`);
+
+  conventional-title:
+    name: Conventional Title Check
+    if: inputs.enable_conventional_title && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Validate PR title
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = context.payload.pull_request.title;
+            const pattern = /^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?!?:\s.+/;
+
+            if (!pattern.test(title)) {
+              const body = [
+                '### PR Title Check Failed',
+                '',
+                `Your PR title \`${title}\` does not follow [Conventional Commits](https://www.conventionalcommits.org/).`,
+                '',
+                '**Expected format:** `type(scope): description`',
+                '',
+                '**Valid types:** `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`, `chore`, `revert`',
+                '',
+                '**Examples:**',
+                '- `feat(auth): add SSO login`',
+                '- `fix: resolve null pointer in user service`',
+                '- `ci: update foundation pipeline`'
+              ].join('\n');
+
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+
+              core.setFailed('PR title does not follow conventional commits format');
+            } else {
+              console.log(`PR title is valid: ${title}`);
+            }
+
+  required-labels:
+    name: Required Labels Check
+    if: inputs.required_labels != '' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Check required labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const required = '${{ inputs.required_labels }}'.split(',').map(l => l.trim()).filter(Boolean);
+            if (required.length === 0) return;
+
+            const { data: labels } = await github.rest.issues.listLabelsOnIssue({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const currentLabels = labels.map(l => l.name);
+            const missing = required.filter(r => !currentLabels.includes(r));
+
+            if (missing.length > 0) {
+              core.setFailed(`Missing required labels: ${missing.join(', ')}`);
+            } else {
+              console.log('All required labels present');
+            }
+
+  stale-check:
+    name: Stale PR Cleanup
+    if: inputs.enable_stale_check
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Process stale PRs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const staleDays = ${{ inputs.stale_days }};
+            const closeDays = ${{ inputs.stale_close_days }};
+            const now = new Date();
+            const staleDate = new Date(now - staleDays * 86400000);
+            const closeDate = new Date(now - (staleDays + closeDays) * 86400000);
+
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              sort: 'updated',
+              direction: 'asc',
+              per_page: 50
+            });
+
+            for (const pr of prs) {
+              const updated = new Date(pr.updated_at);
+              const labels = pr.labels.map(l => l.name);
+
+              if (labels.includes('pinned') || labels.includes('no-stale')) continue;
+
+              if (updated < closeDate && labels.includes('stale')) {
+                console.log(`Closing stale PR #${pr.number}: ${pr.title}`);
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body: `This PR has been automatically closed after ${staleDays + closeDays} days of inactivity. Feel free to reopen if still needed.`
+                });
+                await github.rest.pulls.update({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.number,
+                  state: 'closed'
+                });
+              } else if (updated < staleDate && !labels.includes('stale')) {
+                console.log(`Marking PR #${pr.number} as stale`);
+                try {
+                  await github.rest.issues.getLabel({ owner: context.repo.owner, repo: context.repo.repo, name: 'stale' });
+                } catch {
+                  await github.rest.issues.createLabel({ owner: context.repo.owner, repo: context.repo.repo, name: 'stale', color: 'ededed' });
+                }
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  labels: ['stale']
+                });
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.number,
+                  body: `This PR has been automatically marked as stale after ${staleDays} days of inactivity. It will be closed in ${closeDays} days if no further activity occurs.\n\nAdd the \`pinned\` or \`no-stale\` label to prevent this.`
+                });
+              }
+            }

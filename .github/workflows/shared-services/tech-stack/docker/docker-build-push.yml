@@ -1,0 +1,168 @@
+# =============================================================================
+# Reusable Workflow — Build & Push PropelIQ CI/CD Runner Image
+# =============================================================================
+# Builds the custom runner image and pushes it to GitHub Container Registry.
+#
+# Usage (from a caller workflow):
+#   jobs:
+#     build-runner:
+#       uses: ./.github/workflows/shared-services/tech-stack/docker/docker-build-push.yml
+#       with:
+#         image_name: propeliq-runner
+#         push: true
+#       secrets: inherit
+# =============================================================================
+
+name: Build & Push Docker Image
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: 'Image name (without registry prefix)'
+        required: false
+        type: string
+        default: 'propeliq-runner'
+      push:
+        description: 'Push image to registry'
+        required: false
+        type: boolean
+        default: true
+      dockerfile_path:
+        description: 'Path to Dockerfile'
+        required: false
+        type: string
+        default: '.github/workflows/shared-services/tech-stack/docker/Dockerfile'
+      context_path:
+        description: 'Docker build context path'
+        required: false
+        type: string
+        default: '.github/workflows/shared-services/tech-stack/docker'
+      platforms:
+        description: 'Target platforms (comma-separated)'
+        required: false
+        type: string
+        default: 'linux/amd64'
+      node_version:
+        description: 'Node.js major version'
+        required: false
+        type: string
+        default: '20'
+      dotnet_version:
+        description: '.NET SDK channel version'
+        required: false
+        type: string
+        default: '9.0'
+      terraform_version:
+        description: 'Terraform version'
+        required: false
+        type: string
+        default: '1.9.8'
+    outputs:
+      image_tag:
+        description: 'Full image tag that was pushed'
+        value: ${{ jobs.build.outputs.image_tag }}
+      image_digest:
+        description: 'Image digest (sha256)'
+        value: ${{ jobs.build.outputs.image_digest }}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: Build & Push
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      image_digest: ${{ steps.push.outputs.digest }}
+
+    steps:
+      # -----------------------------------------------------------------
+      # Checkout
+      # -----------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------
+      # Registry authentication
+      # -----------------------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # -----------------------------------------------------------------
+      # Image metadata (tags + labels)
+      # -----------------------------------------------------------------
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image_name }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+
+      # -----------------------------------------------------------------
+      # Build cache setup
+      # -----------------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # -----------------------------------------------------------------
+      # Build & Push
+      # -----------------------------------------------------------------
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context_path }}
+          file: ${{ inputs.dockerfile_path }}
+          push: ${{ inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ inputs.platforms }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            NODE_VERSION=${{ inputs.node_version }}
+            DOTNET_VERSION=${{ inputs.dotnet_version }}
+            TERRAFORM_VERSION=${{ inputs.terraform_version }}
+
+      # -----------------------------------------------------------------
+      # Attestation (supply-chain security)
+      # -----------------------------------------------------------------
+      - name: Generate artifact attestation
+        if: inputs.push
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image_name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      # -----------------------------------------------------------------
+      # Summary
+      # -----------------------------------------------------------------
+      - name: Print image summary
+        run: |
+          echo "## Docker Image Built" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ inputs.image_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tags** | \`${{ steps.meta.outputs.tags }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Digest** | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Platforms** | \`${{ inputs.platforms }}\` |" >> $GITHUB_STEP_SUMMARY

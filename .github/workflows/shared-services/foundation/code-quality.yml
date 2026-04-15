@@ -1,0 +1,128 @@
+name: Code Quality (Shellcheck + BATS)
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      shellcheck_scripts:
+        description: 'Glob pattern for shell scripts to lint'
+        required: false
+        type: string
+        default: 'scripts/*.sh'
+      bats_tests_dir:
+        description: 'Directory containing BATS test files'
+        required: false
+        type: string
+        default: 'scripts/tests'
+      bats_scripts_dir:
+        description: 'Directory containing scripts under test'
+        required: false
+        type: string
+        default: 'scripts'
+      enable_shellcheck:
+        description: 'Run shellcheck'
+        required: false
+        type: boolean
+        default: true
+      enable_bats:
+        description: 'Run BATS tests'
+        required: false
+        type: boolean
+        default: true
+
+jobs:
+  shellcheck:
+    name: Shellcheck
+    if: inputs.enable_shellcheck
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          if ! command -v shellcheck &> /dev/null; then
+            if command -v apk &> /dev/null; then
+              apk add --update shellcheck
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y shellcheck
+            fi
+          fi
+          shellcheck --version
+
+      - name: Run shellcheck
+        run: |
+          echo "## Shellcheck Results" >> $GITHUB_STEP_SUMMARY
+          FILES=$(find . -path "./${{ inputs.shellcheck_scripts }}" -type f 2>/dev/null || true)
+          if [ -z "$FILES" ]; then
+            echo "No shell scripts found matching '${{ inputs.shellcheck_scripts }}'" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          FAILED=0
+          for f in $FILES; do
+            echo "==> Checking $f"
+            if shellcheck "$f"; then
+              echo "- PASS: \`$f\`" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- FAIL: \`$f\`" >> $GITHUB_STEP_SUMMARY
+              FAILED=1
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "FAILED: Shellcheck found issues" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "PASSED: All scripts passed" >> $GITHUB_STEP_SUMMARY
+
+  bats:
+    name: BATS Tests
+    if: inputs.enable_bats
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install BATS
+        run: |
+          if ! command -v bats &> /dev/null; then
+            if command -v apk &> /dev/null; then
+              apk add --update bats curl jq openssl
+            elif command -v apt-get &> /dev/null; then
+              apt-get update && apt-get install -y bats curl jq openssl
+            fi
+          fi
+          bats --version
+
+      - name: Check for test files
+        id: check
+        run: |
+          if [ -d "${{ inputs.bats_tests_dir }}" ] && ls ${{ inputs.bats_tests_dir }}/*.bats 1>/dev/null 2>&1; then
+            echo "has_tests=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_tests=false" >> $GITHUB_OUTPUT
+            echo "No BATS test files found in ${{ inputs.bats_tests_dir }}"
+          fi
+
+      - name: Run BATS tests
+        if: steps.check.outputs.has_tests == 'true'
+        run: |
+          cd "${{ inputs.bats_tests_dir }}"
+          bats . --formatter tap

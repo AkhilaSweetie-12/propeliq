@@ -1,0 +1,245 @@
+name: Terraform Deploy
+
+on:
+  workflow_call:
+    inputs:
+      infra_directory:
+        description: 'Path to root terraform module'
+        required: false
+        type: string
+        default: 'infra'
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      environment:
+        description: 'Target environment (staging, production)'
+        required: true
+        type: string
+      workspace:
+        description: 'Terraform workspace (defaults to "default" for production)'
+        required: false
+        type: string
+        default: 'default'
+      cloud_provider:
+        description: 'Cloud provider (azure, gcp, aws)'
+        required: false
+        type: string
+        default: 'gcp'
+      auto_approve:
+        description: 'Skip manual approval gate'
+        required: false
+        type: boolean
+        default: false
+      backend_config:
+        description: 'Backend config args (key=value, comma-separated)'
+        required: false
+        type: string
+        default: ''
+      create_release:
+        description: 'Create a GitHub release after deploy'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      deployed:
+        description: 'Whether apply was executed'
+        value: ${{ jobs.apply.outputs.deployed }}
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_WORKSPACE: ${{ inputs.workspace }}
+  INFRA_DIR: ${{ inputs.infra_directory }}
+
+jobs:
+
+  plan:
+    name: Plan (${{ inputs.environment }})
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+          [ $EXIT_CODE -eq 1 ] && exit 1 || exit 0
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Plan summary
+        if: steps.plan.outputs.has_changes == 'true'
+        run: |
+          terraform show -json tfplan > plan.json
+          SUMMARY=$(jq -r '
+            ([.resource_changes[]?.change.actions?] | flatten) |
+            {
+              "create": (map(select(. == "create")) | length),
+              "update": (map(select(. == "update")) | length),
+              "delete": (map(select(. == "delete")) | length)
+            }
+          ' plan.json)
+          echo "## Terraform Plan — ${{ inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo '```json' >> $GITHUB_STEP_SUMMARY
+          echo "$SUMMARY" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Upload plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}/tfplan
+          retention-days: 7
+
+  approve:
+    name: Approval Gate (${{ inputs.environment }})
+    if: |
+      !inputs.auto_approve &&
+      needs.plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    needs: [plan]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approved
+        run: echo "Deployment to ${{ inputs.environment }} approved."
+
+  apply:
+    name: Apply (${{ inputs.environment }})
+    if: |
+      needs.plan.outputs.has_changes == 'true' &&
+      (inputs.auto_approve || needs.approve.result == 'success')
+    runs-on: ubuntu-latest
+    needs: [plan, approve]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    concurrency:
+      group: terraform-${{ inputs.environment }}
+      cancel-in-progress: false
+    outputs:
+      deployed: ${{ steps.apply.outputs.deployed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}
+
+      - name: Apply
+        id: apply
+        run: |
+          terraform apply -auto-approve tfplan
+          echo "deployed=true" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Export outputs
+        run: terraform output -json > terraform.outputs.json
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Upload outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}/terraform.outputs.json
+          retention-days: 30
+
+  release:
+    name: Create Release
+    if: inputs.create_release && needs.apply.outputs.deployed == 'true'
+    runs-on: ubuntu-latest
+    needs: [apply]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate tag
+        id: tag
+        run: |
+          LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          IFS='.' read -r MAJOR MINOR PATCH <<< "${LATEST#v}"
+          PATCH=$((PATCH + 1))
+          NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          echo "new_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          echo "Generated tag: $NEW_TAG"
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.new_tag }}
+          name: Release ${{ steps.tag.outputs.new_tag }}
+          body: |
+            Terraform deployment to **${{ inputs.environment }}**
+            - Commit: ${{ github.sha }}
+            - Actor: @${{ github.actor }}
+          generate_release_notes: true

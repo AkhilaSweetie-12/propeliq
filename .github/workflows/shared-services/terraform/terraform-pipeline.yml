@@ -1,0 +1,473 @@
+name: Terraform Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      infra_directory:
+        description: 'Path to root terraform module'
+        required: false
+        type: string
+        default: 'infra'
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      environment:
+        description: 'Target environment (review, staging, production)'
+        required: false
+        type: string
+        default: 'review'
+      workspace:
+        description: 'Terraform workspace name (defaults to environment)'
+        required: false
+        type: string
+        default: ''
+      cloud_provider:
+        description: 'Cloud provider (azure, gcp, aws)'
+        required: false
+        type: string
+        default: 'gcp'
+      apply:
+        description: 'Run terraform apply after plan'
+        required: false
+        type: boolean
+        default: false
+      destroy:
+        description: 'Run terraform destroy'
+        required: false
+        type: boolean
+        default: false
+      plan_only:
+        description: 'Run only lint, validate, and plan (no apply)'
+        required: false
+        type: boolean
+        default: true
+      enable_iac_scan:
+        description: 'Enable IaC security scanning'
+        required: false
+        type: boolean
+        default: true
+      auto_approve:
+        description: 'Skip manual approval for apply'
+        required: false
+        type: boolean
+        default: false
+      backend_config:
+        description: 'Additional backend config args (key=value format, comma-separated)'
+        required: false
+        type: string
+        default: ''
+    outputs:
+      plan_exit_code:
+        description: 'Terraform plan exit code (0=no changes, 2=changes detected)'
+        value: ${{ jobs.plan.outputs.plan_exit_code }}
+      apply_result:
+        description: 'Terraform apply result'
+        value: ${{ jobs.apply.outputs.apply_result }}
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  TF_LOG: WARN
+  TF_WORKSPACE: ${{ inputs.workspace || inputs.environment }}
+  INFRA_DIR: ${{ inputs.infra_directory }}
+
+jobs:
+
+  lint:
+    name: Terraform Lint
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Format check
+        run: terraform fmt -recursive -check -diff
+        working-directory: ${{ env.INFRA_DIR }}
+
+  validate:
+    name: Terraform Validate
+    runs-on: ubuntu-latest
+    needs: [lint]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Init (no backend)
+        run: terraform init -backend=false
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Validate
+        run: terraform validate
+        working-directory: ${{ env.INFRA_DIR }}
+
+  iac-scan:
+    name: IaC Security Scan
+    if: inputs.enable_iac_scan
+    runs-on: ubuntu-latest
+    needs: [lint]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.INFRA_DIR }}
+          soft_fail: true
+
+      - name: Run checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.INFRA_DIR }}
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+        continue-on-error: true
+
+  init:
+    name: Terraform Init
+    runs-on: ubuntu-latest
+    needs: [validate]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      workspace_exists: ${{ steps.workspace.outputs.exists }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init with backend
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Select or create workspace
+        id: workspace
+        run: |
+          if terraform workspace list | grep -qw "$TF_WORKSPACE"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            terraform workspace select "$TF_WORKSPACE"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            terraform workspace new "$TF_WORKSPACE"
+          fi
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Cache Terraform plugins
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.INFRA_DIR }}/.terraform/providers
+            ${{ env.INFRA_DIR }}/.terraform/modules
+          key: terraform-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.INFRA_DIR)) }}
+          restore-keys: terraform-${{ runner.os }}-
+
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+    needs: [init, iac-scan]
+    if: |
+      always() &&
+      needs.init.result == 'success' &&
+      (needs.iac-scan.result == 'success' || needs.iac-scan.result == 'skipped')
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      plan_exit_code: ${{ steps.plan.outputs.exit_code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "No changes detected."
+          elif [ $EXIT_CODE -eq 2 ]; then
+            echo "Changes detected."
+          else
+            echo "Plan failed."
+            exit 1
+          fi
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Show plan
+        if: steps.plan.outputs.exit_code == '2'
+        run: terraform show tfplan
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Plan summary as JSON
+        if: steps.plan.outputs.exit_code == '2'
+        run: |
+          terraform show -json tfplan > plan.json
+          jq -r '
+            ([.resource_changes[]?.change.actions?] | flatten) |
+            {
+              "create": (map(select(. == "create")) | length),
+              "update": (map(select(. == "update")) | length),
+              "delete": (map(select(. == "delete")) | length)
+            }
+          ' plan.json
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request' && steps.plan.outputs.exit_code == '2'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const plan = execSync('terraform show tfplan -no-color', {
+              cwd: '${{ env.INFRA_DIR }}',
+              maxBuffer: 1024 * 1024 * 10
+            }).toString();
+
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n\n... (truncated)'
+              : plan;
+
+            const body = `## Terraform Plan — \`${{ inputs.environment }}\`
+
+            \`\`\`diff
+            ${truncated}
+            \`\`\`
+
+            *Triggered by @${{ github.actor }} in \`${{ env.INFRA_DIR }}\`*`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+      - name: Upload plan artifact
+        if: steps.plan.outputs.exit_code == '2'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}/tfplan
+          retention-days: 7
+
+  approve:
+    name: Manual Approval
+    if: |
+      inputs.apply &&
+      !inputs.auto_approve &&
+      !inputs.destroy &&
+      needs.plan.outputs.plan_exit_code == '2'
+    runs-on: ubuntu-latest
+    needs: [plan]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Approval gate
+        run: echo "Deployment to ${{ inputs.environment }} approved."
+
+  apply:
+    name: Terraform Apply
+    if: |
+      inputs.apply &&
+      !inputs.destroy &&
+      needs.plan.outputs.plan_exit_code == '2' &&
+      (inputs.auto_approve || needs.approve.result == 'success')
+    runs-on: ubuntu-latest
+    needs: [plan, approve]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    concurrency:
+      group: terraform-${{ inputs.environment }}-${{ inputs.infra_directory }}
+      cancel-in-progress: false
+    outputs:
+      apply_result: ${{ steps.apply.outputs.result }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}
+
+      - name: Apply
+        id: apply
+        run: |
+          terraform apply -auto-approve tfplan
+          echo "result=success" >> $GITHUB_OUTPUT
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Save outputs
+        run: terraform output -json > terraform.outputs.json
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Upload outputs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs-${{ inputs.environment }}
+          path: ${{ env.INFRA_DIR }}/terraform.outputs.json
+          retention-days: 30
+
+  destroy:
+    name: Terraform Destroy
+    if: inputs.destroy
+    runs-on: ubuntu-latest
+    needs: [init]
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    concurrency:
+      group: terraform-${{ inputs.environment }}-${{ inputs.infra_directory }}
+      cancel-in-progress: false
+    environment: ${{ inputs.environment }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Destroy
+        run: terraform destroy -auto-approve
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Delete workspace
+        if: env.TF_WORKSPACE != 'default'
+        run: |
+          terraform workspace select default
+          terraform workspace delete -force "$TF_WORKSPACE"
+        working-directory: ${{ env.INFRA_DIR }}
+        continue-on-error: true
+
+  summary:
+    name: Pipeline Summary
+    if: always()
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    needs: [lint, validate, iac-scan, plan, apply, destroy]
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Terraform Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Stage | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Lint** | \`${{ needs.lint.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Validate** | \`${{ needs.validate.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **IaC Scan** | \`${{ needs.iac-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Plan** | \`${{ needs.plan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Apply** | \`${{ needs.apply.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Destroy** | \`${{ needs.destroy.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ inputs.environment }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ env.TF_WORKSPACE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Directory** | \`${{ inputs.infra_directory }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Cloud** | \`${{ inputs.cloud_provider }}\` |" >> $GITHUB_STEP_SUMMARY

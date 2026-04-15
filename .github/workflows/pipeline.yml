@@ -1,0 +1,570 @@
+# =============================================================================
+# PropelIQ — End-to-End CI/CD Pipeline
+# =============================================================================
+#
+# Stage 1: Init           → Foundation auth + Infra init
+# Stage 2: Build          → Docker build, package, sign
+# Stage 3: Analyze Code   → Cloud governance, infra lint, validate, IaC scan
+# Stage 4: Deploy Master  → Production deploy (main branch only)
+# Stage 5: Deploy Review  → PR review environments (plan, review, stop)
+# =============================================================================
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, develop, devops]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+  security-events: write
+  issues: write
+  pull-requests: write
+
+env:
+  REGISTRY: ghcr.io
+  APP_IMAGE: ${{ github.repository_owner }}/propeliq-copilot
+  RUNNER_IMAGE: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
+  INFRA_DIR: infra
+
+# =============================================================================
+# STAGE 1: INIT
+# =============================================================================
+
+jobs:
+
+  # ---------------------------------------------------------------------------
+  # 1a. Foundation — Auth, common functions, semantic release
+  # ---------------------------------------------------------------------------
+  foundation:
+    uses: ./.github/workflows/shared-services/foundation/foundation-pipeline.yml
+    with:
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      enable_gcp_auth: true
+      enable_semantic_release: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+      enable_shellcheck: false
+      enable_bats: false
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 1b. Infra Init — Terraform init with backend + workspace
+  # ---------------------------------------------------------------------------
+  infra-init:
+    name: 'Init: Terraform Backend'
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      init_status: ${{ steps.init.outputs.status }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: GCP authentication
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Terraform init
+        id: init
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          set -euo pipefail
+          echo "==> Initializing Terraform backend"
+          terraform init
+          echo "status=success" >> $GITHUB_OUTPUT
+
+      - name: Cache Terraform providers
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.INFRA_DIR }}/.terraform/providers
+            ${{ env.INFRA_DIR }}/.terraform/modules
+          key: terraform-${{ runner.os }}-${{ hashFiles(format('{0}/.terraform.lock.hcl', env.INFRA_DIR)) }}
+          restore-keys: terraform-${{ runner.os }}-
+
+      - name: Init summary
+        if: always()
+        run: |
+          echo "## Stage 1: Infra Init" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Backend Init** | \`${{ steps.init.outcome }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # STAGE 2: BUILD
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 2a. Docker Build — Build the application image
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: 'Build: Docker Build'
+    needs: [foundation]
+    runs-on: ubuntu-latest
+    outputs:
+      image_meta_tags: ${{ steps.meta.outputs.tags }}
+      image_meta_labels: ${{ steps.meta.outputs.labels }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.APP_IMAGE }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+
+      - name: Build image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUNNER_IMAGE=${{ env.RUNNER_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Test image
+        run: |
+          IMAGE=$(echo "${{ steps.meta.outputs.tags }}" | head -1)
+          echo "==> Testing image: $IMAGE"
+          docker run --rm "$IMAGE" node --version
+          docker run --rm "$IMAGE" terraform version
+          echo "==> Image tests passed"
+
+      - name: Build summary
+        run: |
+          echo "## Stage 2: Docker Build" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.APP_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tags** | \`${{ steps.meta.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # 2b. Docker Package — Push image to GHCR
+  # ---------------------------------------------------------------------------
+  docker-package:
+    name: 'Build: Docker Package'
+    needs: [docker-build]
+    runs-on: ubuntu-latest
+    outputs:
+      image_digest: ${{ steps.push.outputs.digest }}
+      image_tag: ${{ steps.meta.outputs.tags }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.APP_IMAGE }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=pr
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            RUNNER_IMAGE=${{ env.RUNNER_IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Package summary
+        run: |
+          echo "## Stage 2: Docker Package" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Digest** | \`${{ steps.push.outputs.digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Pushed** | \`true\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # 2c. Docker Sign — Attestation & supply-chain provenance
+  # ---------------------------------------------------------------------------
+  docker-sign:
+    name: 'Build: Docker Sign'
+    needs: [docker-package]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.APP_IMAGE }}
+          subject-digest: ${{ needs.docker-package.outputs.image_digest }}
+          push-to-registry: true
+
+      - name: Sign summary
+        run: |
+          echo "## Stage 2: Docker Sign" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Image** | \`${{ env.REGISTRY }}/${{ env.APP_IMAGE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Digest** | \`${{ needs.docker-package.outputs.image_digest }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Attestation** | \`signed\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # STAGE 3: ANALYZE CODE
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 3a. Cloud Governance — Policy, IAM audit, compliance
+  # ---------------------------------------------------------------------------
+  cloud-governance:
+    if: github.event_name == 'pull_request'
+    needs: [foundation]
+    uses: ./.github/workflows/shared-services/security/cloud-governance/governance-pipeline.yml
+    with:
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      infra_directory: infra
+      enable_policy_check: true
+      enable_iam_audit: true
+      enable_cost_check: false
+      enable_compliance_scan: true
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 3b. Infra Lint — Terraform format check
+  # ---------------------------------------------------------------------------
+  infra-lint:
+    name: 'Analyze: Infra Lint'
+    needs: [infra-init]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Terraform fmt check
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          echo "==> Running terraform fmt -check"
+          terraform fmt -recursive -check -diff
+
+      - name: Lint summary
+        if: always()
+        run: |
+          echo "## Stage 3: Infra Lint" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Format Check** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # 3c. Infra Validate — Terraform validate
+  # ---------------------------------------------------------------------------
+  infra-validate:
+    name: 'Analyze: Infra Validate'
+    needs: [infra-lint]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Terraform init (no backend)
+        working-directory: ${{ env.INFRA_DIR }}
+        run: terraform init -backend=false
+
+      - name: Terraform validate
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          echo "==> Running terraform validate"
+          terraform validate
+
+      - name: Validate summary
+        if: always()
+        run: |
+          echo "## Stage 3: Infra Validate" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Validate** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ---------------------------------------------------------------------------
+  # 3d. IaC Scan — Security scanning (tfsec, checkov)
+  # ---------------------------------------------------------------------------
+  iac-scan:
+    name: 'Analyze: IaC Security Scan'
+    needs: [infra-lint]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run tfsec
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ env.INFRA_DIR }}
+          soft_fail: true
+
+      - name: Run checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ env.INFRA_DIR }}
+          soft_fail: true
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+      - name: Upload SARIF to Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+        continue-on-error: true
+
+      - name: Scan summary
+        if: always()
+        run: |
+          echo "## Stage 3: IaC Security Scan" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **tfsec** | \`completed\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **checkov** | \`completed\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================================================
+  # STAGE 4: DEPLOY MASTER REVIEW (main branch push only)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 4a. Master Review — Terraform deploy to production
+  # ---------------------------------------------------------------------------
+  master-review:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [infra-validate, iac-scan, docker-sign]
+    uses: ./.github/workflows/shared-services/terraform/terraform-deploy.yml
+    with:
+      infra_directory: infra
+      environment: production
+      cloud_provider: gcp
+      create_release: true
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 4b. K8s Deploy — Deploy application to GKE
+  # ---------------------------------------------------------------------------
+  k8s-deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [master-review, docker-package]
+    uses: ./.github/workflows/shared-services/tech-stack/kubernetes/k8s-deploy.yml
+    with:
+      cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+      cluster_zone: ${{ vars.GKE_CLUSTER_ZONE }}
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      namespace: production
+      deploy_method: helm
+      environment: production
+      image_tag: ${{ github.sha }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 4c. Health Check — Post-deploy verification
+  # ---------------------------------------------------------------------------
+  health-check:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: [k8s-deploy]
+    uses: ./.github/workflows/shared-services/tech-stack/kubernetes/health-check.yml
+    with:
+      cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+      cluster_zone: ${{ vars.GKE_CLUSTER_ZONE }}
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      namespace: production
+      health_endpoint: ${{ vars.HEALTH_ENDPOINT }}
+      check_pods: true
+      check_services: true
+      rollback_on_failure: true
+    secrets: inherit
+
+  # ===========================================================================
+  # STAGE 5: DEPLOY REVIEW (PR only — plan, review, stop)
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # 5a. Infra Plan + 5b. Infra Review
+  #     (terraform-review.yml handles plan and deploy; destroy is manual)
+  # ---------------------------------------------------------------------------
+  deploy-review:
+    if: github.event_name == 'pull_request'
+    needs: [infra-validate, iac-scan]
+    uses: ./.github/workflows/shared-services/terraform/terraform-review.yml
+    with:
+      infra_directory: infra
+      cloud_provider: gcp
+      auto_destroy_on_merge: false
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # 5d. PR Environment — Ephemeral K8s namespace for PR
+  # ---------------------------------------------------------------------------
+  pr-environment:
+    if: github.event_name == 'pull_request'
+    needs: [deploy-review, docker-package]
+    uses: ./.github/workflows/shared-services/tech-stack/kubernetes/environment-manager.yml
+    with:
+      action: create
+      cluster_name: ${{ vars.GKE_CLUSTER_NAME }}
+      cluster_zone: ${{ vars.GKE_CLUSTER_ZONE }}
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      deploy_method: helm
+      image_tag: ${{ github.sha }}
+      ttl_hours: 48
+    secrets: inherit
+
+  # ===========================================================================
+  # CROSS-CUTTING: Runner Image, PR Automation, Notifications
+  # ===========================================================================
+
+  # ---------------------------------------------------------------------------
+  # Runner Image — Rebuild CI/CD base image when Dockerfile changes
+  # ---------------------------------------------------------------------------
+  build-runner-image:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' &&
+       contains(github.event.head_commit.modified, '.github/workflows/shared-services/tech-stack/docker/'))
+    uses: ./.github/workflows/shared-services/tech-stack/docker/docker-build-push.yml
+    with:
+      image_name: propeliq-runner
+      push: true
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # PR Automation — Labels, size label, conventional commit check
+  # ---------------------------------------------------------------------------
+  pr-automation:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/shared-services/foundation/pr-automation.yml
+    with:
+      enable_auto_label: true
+      enable_size_label: true
+      enable_conventional_title: true
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Notify — Send failure notification
+  # ---------------------------------------------------------------------------
+  notify-on-failure:
+    if: always() && contains(needs.*.result, 'failure')
+    needs:
+      - foundation
+      - infra-init
+      - docker-build
+      - docker-package
+      - docker-sign
+      - infra-lint
+      - infra-validate
+      - iac-scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Send failure notification
+        uses: ./.github/workflows/shared-services/foundation/actions/notify
+        with:
+          channel: slack
+          status: failure
+          title: 'Pipeline Failed'
+          slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ---------------------------------------------------------------------------
+  # Pipeline Summary — Final status report
+  # ---------------------------------------------------------------------------
+  pipeline-summary:
+    name: Pipeline Summary
+    if: always()
+    needs:
+      - foundation
+      - infra-init
+      - docker-build
+      - docker-package
+      - docker-sign
+      - infra-lint
+      - infra-validate
+      - iac-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate pipeline summary
+        run: |
+          echo "# CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Stage 1: Init" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Foundation** | \`${{ needs.foundation.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Infra Init** | \`${{ needs.infra-init.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Stage 2: Build" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Build** | \`${{ needs.docker-build.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Package** | \`${{ needs.docker-package.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Docker Sign** | \`${{ needs.docker-sign.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Stage 3: Analyze Code" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Infra Lint** | \`${{ needs.infra-lint.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Infra Validate** | \`${{ needs.infra-validate.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **IaC Scan** | \`${{ needs.iac-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Trigger** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Actor** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY

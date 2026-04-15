@@ -1,0 +1,100 @@
+name: Artifactory Authentication
+description: |
+  Authenticate to Artifactory using credentials stored in GCP Secret Manager.
+  Fetches JFrog access token and username, then configures Helm repos.
+
+inputs:
+  gcp_project_id:
+    description: 'GCP project ID containing the Artifactory secrets'
+    required: true
+  token_secret_name:
+    description: 'GCP Secret Manager secret name for JFrog access token'
+    required: false
+    default: 'artifactory-access-token'
+  username_secret_name:
+    description: 'GCP Secret Manager secret name for Artifactory username'
+    required: false
+    default: 'artifactory-username'
+  artifactory_url:
+    description: 'Artifactory server URL'
+    required: false
+    default: ''
+  helm_repos:
+    description: 'Space-separated list of Helm repo names to configure'
+    required: false
+    default: ''
+
+outputs:
+  jfrog_access_token:
+    description: 'JFrog access token'
+    value: ${{ steps.artifactory-auth.outputs.jfrog_access_token }}
+  artifactory_username:
+    description: 'Artifactory username'
+    value: ${{ steps.artifactory-auth.outputs.artifactory_username }}
+
+runs:
+  using: composite
+  steps:
+    - name: Fetch Artifactory credentials from GCP Secret Manager
+      id: artifactory-auth
+      shell: bash
+      env:
+        GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+        TOKEN_SECRET: ${{ inputs.token_secret_name }}
+        USERNAME_SECRET: ${{ inputs.username_secret_name }}
+        ARTIFACTORY_URL: ${{ inputs.artifactory_url }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "$ARTIFACTORY_URL" ]; then
+          echo "==> No ARTIFACTORY_URL set, skipping Artifactory auth"
+          exit 0
+        fi
+
+        echo "==> Fetching Artifactory credentials from GCP Secret Manager"
+
+        JFROG_ACCESS_TOKEN=$(gcloud secrets versions access latest \
+          --secret="$TOKEN_SECRET" \
+          --project="$GCP_PROJECT_ID") || {
+          echo "::error::Failed to fetch secret '$TOKEN_SECRET' from project '$GCP_PROJECT_ID'"
+          exit 1
+        }
+
+        ARTIFACTORY_USERNAME=$(gcloud secrets versions access latest \
+          --secret="$USERNAME_SECRET" \
+          --project="$GCP_PROJECT_ID") || {
+          echo "::error::Failed to fetch secret '$USERNAME_SECRET' from project '$GCP_PROJECT_ID'"
+          exit 1
+        }
+
+        echo "::add-mask::$JFROG_ACCESS_TOKEN"
+        echo "jfrog_access_token=$JFROG_ACCESS_TOKEN" >> $GITHUB_OUTPUT
+        echo "artifactory_username=$ARTIFACTORY_USERNAME" >> $GITHUB_OUTPUT
+
+        echo "JFROG_ACCESS_TOKEN=$JFROG_ACCESS_TOKEN" >> $GITHUB_ENV
+        echo "JFROG_URL=$ARTIFACTORY_URL" >> $GITHUB_ENV
+        echo "ARTIFACTORY_USERNAME=$ARTIFACTORY_USERNAME" >> $GITHUB_ENV
+        echo "ARTIFACTORY_PASSWORD=$JFROG_ACCESS_TOKEN" >> $GITHUB_ENV
+
+        echo "==> Artifactory auth successful (user: $ARTIFACTORY_USERNAME)"
+
+    - name: Setup Helm repos
+      if: inputs.helm_repos != ''
+      shell: bash
+      env:
+        HELM_REPOS: ${{ inputs.helm_repos }}
+        ARTIFACTORY_URL: ${{ inputs.artifactory_url }}
+      run: |
+        set -euo pipefail
+        echo "==> Setting up Helm repos: $HELM_REPOS"
+        helm version --short
+
+        for repo in $HELM_REPOS; do
+          helm repo add "$repo" \
+            "${ARTIFACTORY_URL}/artifactory/api/helm/${repo}" \
+            --username="$ARTIFACTORY_USERNAME" \
+            --password="$ARTIFACTORY_PASSWORD"
+        done
+
+        helm repo list
+        helm repo update

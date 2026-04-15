@@ -1,0 +1,118 @@
+# =============================================================================
+# Infra Stop — Developer-triggered review environment teardown
+# =============================================================================
+# Go to Actions → Infra Stop → Run workflow to destroy a review environment.
+# =============================================================================
+
+name: Infra Stop
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to destroy (e.g. 42)'
+        required: false
+        type: string
+        default: ''
+      workspace:
+        description: 'Workspace name (overrides pr_number)'
+        required: false
+        type: string
+        default: ''
+      confirm:
+        description: 'Type "destroy" to confirm'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  INFRA_DIR: infra
+
+jobs:
+  infra-stop:
+    name: Destroy Review Environment
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Validate confirmation
+        run: |
+          if [ "${{ inputs.confirm }}" != "destroy" ]; then
+            echo "::error::You must type 'destroy' to confirm. Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: Resolve workspace name
+        id: workspace
+        run: |
+          if [ -n "${{ inputs.workspace }}" ]; then
+            WS="${{ inputs.workspace }}"
+          elif [ -n "${{ inputs.pr_number }}" ]; then
+            WS="review-${{ inputs.pr_number }}"
+          else
+            echo "::error::Provide either pr_number or workspace"
+            exit 1
+          fi
+          echo "name=$WS" >> $GITHUB_OUTPUT
+          echo "==> Target workspace: $WS"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: GCP authentication
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Terraform init
+        working-directory: ${{ env.INFRA_DIR }}
+        run: terraform init
+
+      - name: Select workspace
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          WS="${{ steps.workspace.outputs.name }}"
+          if terraform workspace list | grep -qw "$WS"; then
+            terraform workspace select "$WS"
+          else
+            echo "::error::Workspace '$WS' does not exist."
+            echo "Available workspaces:"
+            terraform workspace list
+            exit 1
+          fi
+
+      - name: Terraform destroy
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          echo "==> Destroying workspace: ${{ steps.workspace.outputs.name }}"
+          terraform destroy -auto-approve
+
+      - name: Delete workspace
+        working-directory: ${{ env.INFRA_DIR }}
+        run: |
+          terraform workspace select default
+          terraform workspace delete -force "${{ steps.workspace.outputs.name }}"
+        continue-on-error: true
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Infra Stop" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **Workspace** | \`${{ steps.workspace.outputs.name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Triggered by** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,121 @@
+name: Cache Strategy
+description: |
+  Reusable caching for common dependencies — Terraform providers,
+  npm/node_modules, Docker layers, Go modules, Python pip.
+
+inputs:
+  cache_type:
+    description: 'Cache type: terraform, npm, docker, go, pip, or custom'
+    required: true
+  working_directory:
+    description: 'Working directory for cache key hashing'
+    required: false
+    default: '.'
+  custom_path:
+    description: 'Custom cache path (for cache_type=custom)'
+    required: false
+    default: ''
+  custom_key:
+    description: 'Custom cache key suffix (for cache_type=custom)'
+    required: false
+    default: ''
+  save_always:
+    description: 'Save cache even on job failure'
+    required: false
+    default: 'true'
+
+outputs:
+  cache_hit:
+    description: 'Whether cache was restored'
+    value: ${{ steps.cache.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Determine cache parameters
+      id: params
+      shell: bash
+      run: |
+        TYPE="${{ inputs.cache_type }}"
+        WORKDIR="${{ inputs.working_directory }}"
+
+        case "$TYPE" in
+          terraform)
+            echo "path=~/.terraform.d/plugin-cache" >> $GITHUB_OUTPUT
+            echo "key=terraform-providers-${{ runner.os }}-$(find $WORKDIR -name '*.tf' -type f -exec md5sum {} + 2>/dev/null | sort | md5sum | cut -d' ' -f1)" >> $GITHUB_OUTPUT
+            echo "restore_keys=terraform-providers-${{ runner.os }}-" >> $GITHUB_OUTPUT
+
+            # Ensure plugin cache dir config
+            mkdir -p ~/.terraform.d/plugin-cache
+            if [ ! -f ~/.terraformrc ]; then
+              echo 'plugin_cache_dir = "$HOME/.terraform.d/plugin-cache"' > ~/.terraformrc
+            fi
+            ;;
+          npm)
+            echo "path=~/.npm" >> $GITHUB_OUTPUT
+            HASH=""
+            if [ -f "$WORKDIR/package-lock.json" ]; then
+              HASH=$(md5sum "$WORKDIR/package-lock.json" | cut -d' ' -f1)
+            elif [ -f "$WORKDIR/yarn.lock" ]; then
+              HASH=$(md5sum "$WORKDIR/yarn.lock" | cut -d' ' -f1)
+            elif [ -f "$WORKDIR/pnpm-lock.yaml" ]; then
+              HASH=$(md5sum "$WORKDIR/pnpm-lock.yaml" | cut -d' ' -f1)
+            fi
+            echo "key=npm-${{ runner.os }}-${HASH}" >> $GITHUB_OUTPUT
+            echo "restore_keys=npm-${{ runner.os }}-" >> $GITHUB_OUTPUT
+            ;;
+          docker)
+            echo "path=/tmp/.buildx-cache" >> $GITHUB_OUTPUT
+            HASH=""
+            if [ -f "$WORKDIR/Dockerfile" ]; then
+              HASH=$(md5sum "$WORKDIR/Dockerfile" | cut -d' ' -f1)
+            fi
+            echo "key=docker-${{ runner.os }}-${HASH}" >> $GITHUB_OUTPUT
+            echo "restore_keys=docker-${{ runner.os }}-" >> $GITHUB_OUTPUT
+            ;;
+          go)
+            echo "path=~/go/pkg/mod" >> $GITHUB_OUTPUT
+            HASH=""
+            if [ -f "$WORKDIR/go.sum" ]; then
+              HASH=$(md5sum "$WORKDIR/go.sum" | cut -d' ' -f1)
+            fi
+            echo "key=go-${{ runner.os }}-${HASH}" >> $GITHUB_OUTPUT
+            echo "restore_keys=go-${{ runner.os }}-" >> $GITHUB_OUTPUT
+            ;;
+          pip)
+            echo "path=~/.cache/pip" >> $GITHUB_OUTPUT
+            HASH=""
+            if [ -f "$WORKDIR/requirements.txt" ]; then
+              HASH=$(md5sum "$WORKDIR/requirements.txt" | cut -d' ' -f1)
+            fi
+            echo "key=pip-${{ runner.os }}-${HASH}" >> $GITHUB_OUTPUT
+            echo "restore_keys=pip-${{ runner.os }}-" >> $GITHUB_OUTPUT
+            ;;
+          custom)
+            echo "path=${{ inputs.custom_path }}" >> $GITHUB_OUTPUT
+            echo "key=custom-${{ runner.os }}-${{ inputs.custom_key }}" >> $GITHUB_OUTPUT
+            echo "restore_keys=custom-${{ runner.os }}-" >> $GITHUB_OUTPUT
+            ;;
+          *)
+            echo "::error::Unknown cache type: $TYPE"
+            exit 1
+            ;;
+        esac
+
+    - name: Restore cache
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ steps.params.outputs.path }}
+        key: ${{ steps.params.outputs.key }}
+        restore-keys: ${{ steps.params.outputs.restore_keys }}
+        save-always: ${{ inputs.save_always }}
+
+    - name: Cache status
+      shell: bash
+      run: |
+        if [ "${{ steps.cache.outputs.cache-hit }}" = "true" ]; then
+          echo "==> Cache HIT for key: ${{ steps.params.outputs.key }}"
+        else
+          echo "==> Cache MISS for key: ${{ steps.params.outputs.key }}"
+        fi

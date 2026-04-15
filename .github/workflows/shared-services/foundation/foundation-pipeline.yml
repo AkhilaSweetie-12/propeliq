@@ -1,0 +1,189 @@
+name: Foundation Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      gcp_project_id:
+        description: 'GCP project ID'
+        required: true
+        type: string
+      enable_gcp_auth:
+        description: 'Authenticate to GCP via Workload Identity'
+        required: false
+        type: boolean
+        default: true
+      enable_artifactory_auth:
+        description: 'Fetch Artifactory credentials from GCP Secret Manager'
+        required: false
+        type: boolean
+        default: false
+      artifactory_url:
+        description: 'Artifactory server URL'
+        required: false
+        type: string
+        default: ''
+      artifactory_helm_repos:
+        description: 'Space-separated Helm repo names'
+        required: false
+        type: string
+        default: ''
+      enable_consul_auth:
+        description: 'Fetch Consul token from GCP Secret Manager'
+        required: false
+        type: boolean
+        default: false
+      consul_addr:
+        description: 'Consul server address'
+        required: false
+        type: string
+        default: ''
+      secret_names:
+        description: 'Comma-separated secret names to fetch from GCP Secret Manager'
+        required: false
+        type: string
+        default: ''
+      enable_semantic_release:
+        description: 'Run semantic release on default branch'
+        required: false
+        type: boolean
+        default: false
+      enable_shellcheck:
+        description: 'Run shellcheck on scripts'
+        required: false
+        type: boolean
+        default: false
+      enable_bats:
+        description: 'Run BATS tests'
+        required: false
+        type: boolean
+        default: false
+      shellcheck_scripts:
+        description: 'Glob for shell scripts to lint'
+        required: false
+        type: string
+        default: 'scripts/*.sh'
+      bats_tests_dir:
+        description: 'BATS test directory'
+        required: false
+        type: string
+        default: 'scripts/tests'
+
+jobs:
+
+  authenticate:
+    name: Foundation Auth
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      google_oauth_token: ${{ steps.gcp.outputs.google_oauth_token }}
+      consul_token: ${{ steps.consul.outputs.consul_token }}
+      jfrog_access_token: ${{ steps.artifactory.outputs.jfrog_access_token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load common functions
+        uses: ./.github/workflows/shared-services/foundation/actions/common-functions
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git credentials
+        uses: ./.github/workflows/shared-services/foundation/actions/git-credentials
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: GCP authentication via Workload Identity
+        if: inputs.enable_gcp_auth
+        id: gcp
+        uses: ./.github/workflows/shared-services/foundation/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          gcp_project_id: ${{ inputs.gcp_project_id }}
+
+      - name: Fetch secrets from GCP Secret Manager
+        if: inputs.secret_names != ''
+        id: secrets
+        uses: ./.github/workflows/shared-services/foundation/actions/gcp-secret-manager
+        with:
+          gcp_project_id: ${{ inputs.gcp_project_id }}
+          secret_names: ${{ inputs.secret_names }}
+
+      - name: Consul authentication
+        if: inputs.enable_consul_auth
+        id: consul
+        uses: ./.github/workflows/shared-services/foundation/actions/consul-auth
+        with:
+          gcp_project_id: ${{ inputs.gcp_project_id }}
+          consul_addr: ${{ inputs.consul_addr }}
+
+      - name: Artifactory authentication
+        if: inputs.enable_artifactory_auth && inputs.artifactory_url != ''
+        id: artifactory
+        uses: ./.github/workflows/shared-services/foundation/actions/artifactory-auth
+        with:
+          gcp_project_id: ${{ inputs.gcp_project_id }}
+          artifactory_url: ${{ inputs.artifactory_url }}
+          helm_repos: ${{ inputs.artifactory_helm_repos }}
+
+      - name: Auth summary
+        if: always()
+        run: |
+          echo "## Foundation Auth Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| **GCP (Workload Identity)** | \`${{ steps.gcp.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **GCP Secret Manager** | \`${{ steps.secrets.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Consul** | \`${{ steps.consul.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Artifactory** | \`${{ steps.artifactory.outcome || 'skipped' }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  code-quality:
+    name: Code Quality
+    if: inputs.enable_shellcheck || inputs.enable_bats
+    uses: ./.github/workflows/shared-services/foundation/code-quality.yml
+    with:
+      runner_image: ${{ inputs.runner_image }}
+      shellcheck_scripts: ${{ inputs.shellcheck_scripts }}
+      bats_tests_dir: ${{ inputs.bats_tests_dir }}
+      enable_shellcheck: ${{ inputs.enable_shellcheck }}
+      enable_bats: ${{ inputs.enable_bats }}
+    secrets: inherit
+
+  semantic-release:
+    name: Semantic Release
+    if: inputs.enable_semantic_release
+    needs: [authenticate]
+    uses: ./.github/workflows/shared-services/foundation/semantic-release.yml
+    with:
+      runner_image: ${{ inputs.runner_image }}
+    secrets: inherit
+
+  cleanup:
+    name: Credential Cleanup
+    if: always()
+    needs: [authenticate, semantic-release]
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clean up credentials
+        uses: ./.github/workflows/shared-services/foundation/actions/cleanup

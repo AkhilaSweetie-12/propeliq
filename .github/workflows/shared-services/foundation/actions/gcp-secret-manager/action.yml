@@ -1,0 +1,96 @@
+name: GCP Secret Manager
+description: |
+  Fetch secrets from GCP Secret Manager using Workload Identity Federation.
+
+inputs:
+  gcp_project_id:
+    description: 'GCP project ID containing the secrets'
+    required: true
+  secret_names:
+    description: 'Comma-separated secret names to fetch from GCP Secret Manager'
+    required: false
+    default: ''
+  secret_version:
+    description: 'Secret version to fetch (latest if empty)'
+    required: false
+    default: 'latest'
+  export_as_env:
+    description: 'Export fetched secrets as environment variables'
+    required: false
+    default: 'true'
+  export_prefix:
+    description: 'Prefix for exported environment variable names (e.g. GSM_)'
+    required: false
+    default: ''
+
+outputs:
+  secrets_json:
+    description: 'JSON map of secret_name -> secret_value (masked)'
+    value: ${{ steps.fetch.outputs.secrets_json }}
+
+runs:
+  using: composite
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [ -z "${{ inputs.gcp_project_id }}" ]; then
+          echo "::error::gcp_project_id is required"
+          exit 1
+        fi
+
+    - name: Fetch secrets from GCP Secret Manager
+      id: fetch
+      shell: bash
+      env:
+        GCP_PROJECT_ID: ${{ inputs.gcp_project_id }}
+        SECRET_NAMES: ${{ inputs.secret_names }}
+        SECRET_VERSION: ${{ inputs.secret_version }}
+        EXPORT_AS_ENV: ${{ inputs.export_as_env }}
+        EXPORT_PREFIX: ${{ inputs.export_prefix }}
+      run: |
+        set -euo pipefail
+
+        VERSION="${SECRET_VERSION:-latest}"
+        SECRETS_JSON="{}"
+        FETCHED=0
+        FAILED=0
+
+        if [ -z "$SECRET_NAMES" ]; then
+          echo "==> No secret names specified, listing available secrets"
+          gcloud secrets list --project="$GCP_PROJECT_ID" --format="value(name)" || true
+          echo "secrets_json={}" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        IFS=',' read -ra NAMES <<< "$SECRET_NAMES"
+        for secret_name in "${NAMES[@]}"; do
+          secret_name=$(echo "$secret_name" | xargs)
+          [ -z "$secret_name" ] && continue
+
+          echo "==> Fetching secret: $secret_name (version: $VERSION)"
+          SECRET_VALUE=$(gcloud secrets versions access "$VERSION" \
+            --secret="$secret_name" \
+            --project="$GCP_PROJECT_ID" 2>/dev/null) || {
+            echo "::warning::Failed to fetch secret: $secret_name"
+            FAILED=$((FAILED + 1))
+            continue
+          }
+
+          echo "::add-mask::$SECRET_VALUE"
+          FETCHED=$((FETCHED + 1))
+
+          # Build JSON output
+          SECRETS_JSON=$(echo "$SECRETS_JSON" | jq \
+            --arg k "$secret_name" --arg v "$SECRET_VALUE" '. + {($k): $v}')
+
+          # Export as environment variable
+          if [ "$EXPORT_AS_ENV" = "true" ]; then
+            ENV_NAME="${EXPORT_PREFIX}$(echo "$secret_name" | tr '[:lower:]-' '[:upper:]_')"
+            echo "$ENV_NAME=$SECRET_VALUE" >> $GITHUB_ENV
+            echo "==> Exported as \$${ENV_NAME}"
+          fi
+        done
+
+        echo "secrets_json=$(echo "$SECRETS_JSON" | jq -c '.')" >> $GITHUB_OUTPUT
+        echo "==> Fetched $FETCHED secret(s), $FAILED failed"
