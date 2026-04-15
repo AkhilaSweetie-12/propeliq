@@ -568,3 +568,4 @@ jobs:
           echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **SHA** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Actor** | @${{ github.actor }} |" >> $GITHUB_STEP_SUMMARY
+
