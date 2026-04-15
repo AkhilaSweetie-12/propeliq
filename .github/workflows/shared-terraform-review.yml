@@ -1,0 +1,235 @@
+name: Terraform Review Environment
+
+on:
+  workflow_call:
+    inputs:
+      infra_directory:
+        description: 'Path to root terraform module'
+        required: false
+        type: string
+        default: 'infra'
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      cloud_provider:
+        description: 'Cloud provider (azure, gcp, aws)'
+        required: false
+        type: string
+        default: 'gcp'
+      backend_config:
+        description: 'Backend config args (key=value, comma-separated)'
+        required: false
+        type: string
+        default: ''
+      auto_destroy_on_merge:
+        description: 'Auto-destroy review env when PR is merged/closed'
+        required: false
+        type: boolean
+        default: true
+
+env:
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
+  INFRA_DIR: ${{ inputs.infra_directory }}
+  TF_WORKSPACE: review-${{ github.event.pull_request.number || github.ref_name }}
+
+jobs:
+
+  review-plan:
+    name: Plan Review
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      has_changes: ${{ steps.plan.outputs.has_changes }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Create workspace if needed
+        run: |
+          terraform workspace list | grep -qw "$TF_WORKSPACE" \
+            || terraform workspace new "$TF_WORKSPACE"
+          terraform workspace select "$TF_WORKSPACE"
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -detailed-exitcode -out=tfplan
+          EXIT_CODE=$?
+          if [ $EXIT_CODE -eq 2 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          fi
+          [ $EXIT_CODE -eq 1 ] && exit 1 || exit 0
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Comment plan on PR
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const plan = execSync('terraform show tfplan -no-color', {
+              cwd: '${{ env.INFRA_DIR }}',
+              maxBuffer: 1024 * 1024 * 10
+            }).toString();
+
+            const truncated = plan.length > 60000
+              ? plan.substring(0, 60000) + '\n... (truncated)'
+              : plan;
+
+            const body = `## Terraform Review Plan — \`${{ env.TF_WORKSPACE }}\`
+            \`\`\`diff
+            ${truncated}
+            \`\`\`
+            *Workspace:* \`${{ env.TF_WORKSPACE }}\` | *Triggered by:* @${{ github.actor }}`;
+
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });
+
+      - name: Upload plan
+        if: steps.plan.outputs.has_changes == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-review-${{ github.event.pull_request.number }}
+          path: ${{ env.INFRA_DIR }}/tfplan
+          retention-days: 3
+
+  review-deploy:
+    name: Deploy Review
+    needs: [review-plan]
+    if: needs.review-plan.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    concurrency:
+      group: terraform-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    environment:
+      name: review/pr-${{ github.event.pull_request.number }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+          terraform workspace select "$TF_WORKSPACE"
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Download plan
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-review-${{ github.event.pull_request.number }}
+          path: ${{ env.INFRA_DIR }}
+
+      - name: Apply
+        run: terraform apply -auto-approve tfplan
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Save outputs
+        run: terraform output -json > terraform.outputs.json
+        working-directory: ${{ env.INFRA_DIR }}
+
+  review-destroy:
+    name: Destroy Review
+    if: |
+      inputs.auto_destroy_on_merge &&
+      github.event_name == 'pull_request' &&
+      github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    concurrency:
+      group: terraform-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cloud authentication
+        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
+        with:
+          cloud_provider: ${{ inputs.cloud_provider }}
+
+      - name: Init
+        run: |
+          BACKEND_ARGS=""
+          if [ -n "${{ inputs.backend_config }}" ]; then
+            IFS=',' read -ra CONFIGS <<< "${{ inputs.backend_config }}"
+            for config in "${CONFIGS[@]}"; do
+              BACKEND_ARGS="$BACKEND_ARGS -backend-config=$config"
+            done
+          fi
+          terraform init $BACKEND_ARGS
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Select workspace
+        run: |
+          if terraform workspace list | grep -qw "$TF_WORKSPACE"; then
+            terraform workspace select "$TF_WORKSPACE"
+          else
+            echo "Workspace $TF_WORKSPACE does not exist. Nothing to destroy."
+            exit 0
+          fi
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Destroy
+        run: terraform destroy -auto-approve
+        working-directory: ${{ env.INFRA_DIR }}
+
+      - name: Delete workspace
+        run: |
+          terraform workspace select default
+          terraform workspace delete -force "$TF_WORKSPACE"
+        working-directory: ${{ env.INFRA_DIR }}
+        continue-on-error: true

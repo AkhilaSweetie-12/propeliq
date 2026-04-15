@@ -1,0 +1,246 @@
+name: Health Check & Smoke Test
+
+on:
+  workflow_call:
+    inputs:
+      runner_image:
+        description: 'CI/CD runner container image'
+        required: false
+        type: string
+        default: 'ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest'
+      cluster_name:
+        description: 'GKE cluster name'
+        required: true
+        type: string
+      cluster_zone:
+        description: 'GKE cluster zone or region'
+        required: true
+        type: string
+      gcp_project_id:
+        description: 'GCP project ID'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: false
+        type: string
+        default: 'default'
+      health_endpoint:
+        description: 'HTTP health endpoint URL (e.g. https://app.example.com/health)'
+        required: false
+        type: string
+        default: ''
+      smoke_test_script:
+        description: 'Path to custom smoke test script'
+        required: false
+        type: string
+        default: ''
+      expected_status_code:
+        description: 'Expected HTTP status code from health endpoint'
+        required: false
+        type: number
+        default: 200
+      retries:
+        description: 'Number of health check retries'
+        required: false
+        type: number
+        default: 5
+      retry_interval:
+        description: 'Seconds between retries'
+        required: false
+        type: number
+        default: 15
+      check_pods:
+        description: 'Verify all pods are Running/Ready'
+        required: false
+        type: boolean
+        default: true
+      check_services:
+        description: 'Verify service endpoints exist'
+        required: false
+        type: boolean
+        default: true
+      rollback_on_failure:
+        description: 'Trigger rollback if health check fails'
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      healthy:
+        description: 'Whether all health checks passed'
+        value: ${{ jobs.health-check.outputs.healthy }}
+
+jobs:
+  health-check:
+    name: Health Check
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.runner_image }}
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      healthy: ${{ steps.result.outputs.healthy }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Get GKE credentials
+        run: |
+          gcloud container clusters get-credentials \
+            "${{ inputs.cluster_name }}" \
+            --zone "${{ inputs.cluster_zone }}" \
+            --project "${{ inputs.gcp_project_id }}"
+
+      - name: Check pod health
+        if: inputs.check_pods
+        id: pods
+        run: |
+          set -euo pipefail
+          echo "==> Checking pod status in namespace: ${{ inputs.namespace }}"
+          UNHEALTHY=0
+
+          PODS=$(kubectl get pods -n "${{ inputs.namespace }}" -o json)
+          TOTAL=$(echo "$PODS" | jq '.items | length')
+          RUNNING=$(echo "$PODS" | jq '[.items[] | select(.status.phase == "Running")] | length')
+          READY=$(echo "$PODS" | jq '[.items[] | select(.status.conditions[]? | select(.type == "Ready" and .status == "True"))] | length')
+          FAILED=$(echo "$PODS" | jq '[.items[] | select(.status.phase == "Failed" or .status.phase == "CrashLoopBackOff")] | length')
+
+          echo "## Pod Health" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total | $TOTAL |" >> $GITHUB_STEP_SUMMARY
+          echo "| Running | $RUNNING |" >> $GITHUB_STEP_SUMMARY
+          echo "| Ready | $READY |" >> $GITHUB_STEP_SUMMARY
+          echo "| Failed | $FAILED |" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$FAILED" -gt 0 ]; then
+            echo "::error::$FAILED pod(s) in failed state"
+            kubectl get pods -n "${{ inputs.namespace }}" --field-selector=status.phase=Failed
+            UNHEALTHY=1
+          fi
+
+          if [ "$READY" -lt "$TOTAL" ]; then
+            echo "::warning::Only $READY/$TOTAL pods are ready"
+            UNHEALTHY=1
+          fi
+
+          echo "unhealthy=$UNHEALTHY" >> $GITHUB_OUTPUT
+
+      - name: Check service endpoints
+        if: inputs.check_services
+        id: services
+        run: |
+          set -euo pipefail
+          echo "==> Checking service endpoints in namespace: ${{ inputs.namespace }}"
+          UNHEALTHY=0
+
+          SERVICES=$(kubectl get services -n "${{ inputs.namespace }}" -o json)
+          SVC_COUNT=$(echo "$SERVICES" | jq '.items | length')
+
+          echo "## Service Endpoints" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Type | Endpoints |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|-----------|" >> $GITHUB_STEP_SUMMARY
+
+          echo "$SERVICES" | jq -c '.items[]' | while read -r svc; do
+            NAME=$(echo "$svc" | jq -r '.metadata.name')
+            TYPE=$(echo "$svc" | jq -r '.spec.type')
+            EP_COUNT=$(kubectl get endpoints "$NAME" -n "${{ inputs.namespace }}" -o json | \
+              jq '[.subsets[]?.addresses // [] | length] | add // 0')
+
+            if [ "$EP_COUNT" -eq 0 ] && [ "$TYPE" != "ExternalName" ]; then
+              echo "| \`$NAME\` | $TYPE | NONE |" >> $GITHUB_STEP_SUMMARY
+              echo "::warning::Service $NAME has no endpoints"
+              UNHEALTHY=1
+            else
+              echo "| \`$NAME\` | $TYPE | $EP_COUNT |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          echo "unhealthy=$UNHEALTHY" >> $GITHUB_OUTPUT
+
+      - name: HTTP health endpoint check
+        if: inputs.health_endpoint != ''
+        id: http
+        run: |
+          set -euo pipefail
+          ENDPOINT="${{ inputs.health_endpoint }}"
+          EXPECTED=${{ inputs.expected_status_code }}
+          RETRIES=${{ inputs.retries }}
+          INTERVAL=${{ inputs.retry_interval }}
+          ATTEMPT=1
+
+          echo "## HTTP Health Check" >> $GITHUB_STEP_SUMMARY
+          echo "- **Endpoint:** \`$ENDPOINT\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Expected status:** \`$EXPECTED\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          while [ $ATTEMPT -le $RETRIES ]; do
+            echo "==> Attempt $ATTEMPT/$RETRIES: GET $ENDPOINT"
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 "$ENDPOINT" 2>/dev/null || echo "000")
+
+            if [ "$STATUS" -eq "$EXPECTED" ]; then
+              echo "PASSED: Health check returned $STATUS (attempt $ATTEMPT)" >> $GITHUB_STEP_SUMMARY
+              echo "healthy=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            echo "::warning::Attempt $ATTEMPT: got $STATUS, expected $EXPECTED"
+            ATTEMPT=$((ATTEMPT + 1))
+            sleep "$INTERVAL"
+          done
+
+          echo "FAILED: Health check did not return $EXPECTED after $RETRIES attempts" >> $GITHUB_STEP_SUMMARY
+          echo "healthy=false" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Run smoke tests
+        if: inputs.smoke_test_script != ''
+        id: smoke
+        run: |
+          set -euo pipefail
+          SCRIPT="${{ inputs.smoke_test_script }}"
+          if [ ! -f "$SCRIPT" ]; then
+            echo "::error::Smoke test script not found: $SCRIPT"
+            exit 1
+          fi
+          echo "==> Running smoke tests: $SCRIPT"
+          chmod +x "$SCRIPT"
+          bash "$SCRIPT"
+
+      - name: Rollback on failure
+        if: failure() && inputs.rollback_on_failure
+        run: |
+          echo "==> Health check failed — initiating rollback"
+          DEPLOYMENTS=$(kubectl get deployments -n "${{ inputs.namespace }}" -o jsonpath='{.items[*].metadata.name}')
+          for dep in $DEPLOYMENTS; do
+            echo "==> Rolling back deployment/$dep"
+            kubectl rollout undo deployment/"$dep" -n "${{ inputs.namespace }}" || true
+          done
+          echo "WARNING: Rollback triggered due to health check failure" >> $GITHUB_STEP_SUMMARY
+
+      - name: Final result
+        id: result
+        if: always()
+        run: |
+          POD_FAIL="${{ steps.pods.outputs.unhealthy }}"
+          SVC_FAIL="${{ steps.services.outputs.unhealthy }}"
+          HTTP_OK="${{ steps.http.outputs.healthy }}"
+
+          if [ "$POD_FAIL" = "1" ] || [ "$SVC_FAIL" = "1" ] || [ "$HTTP_OK" = "false" ]; then
+            echo "healthy=false" >> $GITHUB_OUTPUT
+          else
+            echo "healthy=true" >> $GITHUB_OUTPUT
+          fi
