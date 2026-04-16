@@ -126,7 +126,7 @@ jobs:
     concurrency:
       group: deploy-dev
       cancel-in-progress: false
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'dev'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Auth to Google Cloud (OIDC)
         uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
@@ -152,7 +152,7 @@ jobs:
     concurrency:
       group: deploy-prod
       cancel-in-progress: false
-    if: github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_target == 'prod'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     steps:
       - name: Auth to Google Cloud (OIDC)
         uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
