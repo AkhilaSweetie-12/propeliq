@@ -65,7 +65,7 @@ jobs:
           fetch-depth: 0
 
       - name: Run gitleaks
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2777a1df75f5f4b3d8bc07b9b571  # v2.3.9
+        uses: gitleaks/gitleaks-action@v2
 
       - name: Run trivy fs scan
         uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # 0.28.0
