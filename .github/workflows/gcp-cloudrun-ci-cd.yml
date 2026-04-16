@@ -97,7 +97,7 @@ jobs:
           service_account: ${{ env.DEPLOY_SA }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Configure Docker auth
         run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
@@ -126,7 +126,7 @@ jobs:
           service_account: ${{ env.DEPLOY_SA }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy Cloud Run
         run: |
@@ -152,7 +152,7 @@ jobs:
           service_account: ${{ env.DEPLOY_SA }}
 
       - name: Setup gcloud
-        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+        uses: google-github-actions/setup-gcloud@v2
 
       - name: Deploy Cloud Run
         run: |
