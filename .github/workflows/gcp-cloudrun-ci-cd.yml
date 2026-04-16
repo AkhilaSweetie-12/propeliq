@@ -12,6 +12,7 @@ permissions:
   id-token: write
 
 env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
   GCP_PROJECT_ID: akhila-gcp-123-493309
   GCP_REGION: us-central1
   ARTIFACT_REPO: app-images
