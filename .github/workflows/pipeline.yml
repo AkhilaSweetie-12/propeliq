@@ -15,7 +15,7 @@ on:
     branches: [main, develop, devops, 'feat/**']
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, closed]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -40,11 +40,6 @@ jobs:
   infra-init:
     name: 'Init: Terraform Backend'
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       init_status: ${{ steps.init.outputs.status }}
     steps:
@@ -341,11 +336,6 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     needs: [iac-scan, docker-sign]
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -387,11 +377,6 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: [iac-scan]
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     outputs:
       plan_exit_code: ${{ steps.plan.outputs.exit_code }}
     steps:
@@ -449,11 +434,6 @@ jobs:
     if: github.event_name == 'pull_request'
     needs: [infra-plan]
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -495,62 +475,7 @@ jobs:
           echo "| **Workspace** | \`review-${{ github.event.pull_request.number }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Apply Status** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
 
-  infra-stop:
-    name: 'Review: Infra Stop'
-    if: github.event_name == 'pull_request' && github.event.action == 'closed'
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/${{ github.repository_owner }}/propeliq-runner:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: GCP authentication
-        uses: ./.github/workflows/shared-services/terraform/actions/cloud-auth
-        with:
-          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
-          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
-
-      - name: Terraform init
-        working-directory: ${{ env.INFRA_DIR }}
-        run: terraform init
-
-      - name: Select review workspace
-        working-directory: ${{ env.INFRA_DIR }}
-        run: |
-          WORKSPACE="review-${{ github.event.pull_request.number }}"
-          if terraform workspace list | grep -qw "$WORKSPACE"; then
-            terraform workspace select "$WORKSPACE"
-          else
-            echo "::warning::Workspace $WORKSPACE does not exist. Nothing to destroy."
-            exit 0
-          fi
-
-      - name: Terraform destroy
-        working-directory: ${{ env.INFRA_DIR }}
-        run: terraform destroy -auto-approve
-
-      - name: Delete workspace
-        working-directory: ${{ env.INFRA_DIR }}
-        run: |
-          terraform workspace select default
-          terraform workspace delete -force "review-${{ github.event.pull_request.number }}"
-        continue-on-error: true
-
-      - name: Stop summary
-        if: always()
-        run: |
-          echo "## Stage 5: Infra Stop" >> $GITHUB_STEP_SUMMARY
-          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **PR** | #${{ github.event.pull_request.number }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Workspace** | \`review-${{ github.event.pull_request.number }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Destroy Status** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
-
+  
   # ===========================================================================
   # PIPELINE SUMMARY
   # ===========================================================================
@@ -603,7 +528,6 @@ jobs:
           echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Infra Plan** | \`${{ needs.infra-plan.result }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Infra Review** | \`${{ needs.infra-review.result }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Infra Stop** | \`${{ needs.infra-stop.result }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
