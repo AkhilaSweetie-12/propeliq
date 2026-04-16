@@ -1,0 +1,162 @@
+name: gcp-cloudrun-ci-cd
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  GCP_PROJECT_ID: akhila-gcp-123-493309
+  GCP_REGION: us-central1
+  ARTIFACT_REPO: app-images
+  SERVICE_NAME: app-service
+  PYTHON_VERSION: "3.11"
+  WORKLOAD_IDENTITY_PROVIDER: projects/828956650755/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+  DEPLOY_SA: github-deployer@akhila-gcp-123-493309.iam.gserviceaccount.com
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Setup Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          pip install pytest
+
+      - name: Run Python tests
+        run: |
+          if [ -d tests ] || ls test_*.py >/dev/null 2>&1; then
+            pytest -q
+          else
+            echo "No tests found, skipping pytest."
+          fi
+
+      - name: Basic repo validation
+        run: |
+          test -f Dockerfile || (echo "Dockerfile not found" && exit 1)
+
+  security:
+    runs-on: ubuntu-latest
+    needs: [validate]
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2777a1df75f5f4b3d8bc07b9b571  # v2.3.9
+
+      - name: Run trivy fs scan
+        uses: aquasecurity/trivy-action@6e7b7d1fd3e4fef0c5fa8cce1229c54b2c9bd0d8  # 0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: 1
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: [security]
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Build metadata
+        id: meta
+        run: |
+          echo "image=${{ env.GCP_REGION }}-docker.pkg.dev/${{ env.GCP_PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker "${{ env.GCP_REGION }}-docker.pkg.dev" --quiet
+
+      - name: Build image
+        run: |
+          IMAGE="${{ steps.meta.outputs.image }}"
+          docker build -t "$IMAGE" .
+
+      - name: Push image
+        run: docker push "${{ steps.meta.outputs.image }}"
+
+  deploy-dev:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment: dev
+    concurrency:
+      group: deploy-dev
+      cancel-in-progress: false
+    if: github.event_name != 'pull_request'
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+
+      - name: Deploy Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE_NAME }}-dev" \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.GCP_REGION }}" \
+            --image "${{ needs.build-and-push.outputs.image }}" \
+            --allow-unauthenticated  # dev only — restrict for staging/prod
+
+  deploy-prod:
+    runs-on: ubuntu-latest
+    needs: [build-and-push]
+    environment: prod
+    concurrency:
+      group: deploy-prod
+      cancel-in-progress: false
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    steps:
+      - name: Auth to Google Cloud (OIDC)
+        uses: google-github-actions/auth@ba79af03959ebeac9769e648f473a284504d9193  # v2.1.10
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOY_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@77e7a554d41ea17644ae4b29a8e4b09f8042565b  # v2.1.4
+
+      - name: Deploy Cloud Run
+        run: |
+          gcloud run deploy "${{ env.SERVICE_NAME }}" \
+            --project "${{ env.GCP_PROJECT_ID }}" \
+            --region "${{ env.GCP_REGION }}" \
+            --image "${{ needs.build-and-push.outputs.image }}" \
+            --no-allow-unauthenticated

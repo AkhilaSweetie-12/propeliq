@@ -1,0 +1,33 @@
+name: Terraform Plan
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        run: terraform -chdir=.propel/context/iac/gcp/terraform init
+      - name: Terraform plan
+        run: terraform -chdir=.propel/context/iac/gcp/terraform plan -var-file=environments/${{ inputs.environment }}/terraform.tfvars -out=tfplan
+      - name: Upload plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ inputs.environment }}
+          path: .propel/context/iac/gcp/terraform/tfplan

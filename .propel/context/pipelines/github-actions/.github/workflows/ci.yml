@@ -1,0 +1,29 @@
+name: CI Infrastructure
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  terraform-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt
+        run: terraform -chdir=.propel/context/iac/gcp/terraform fmt -check -recursive
+
+      - name: Terraform init
+        run: terraform -chdir=.propel/context/iac/gcp/terraform init -backend=false
+
+      - name: Terraform validate
+        run: terraform -chdir=.propel/context/iac/gcp/terraform validate

@@ -1,0 +1,15 @@
+name: Deploy QA
+
+on:
+  push:
+    branches: [release/*]
+
+jobs:
+  deploy-qa:
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=.propel/context/iac/gcp/terraform init
+      - run: terraform -chdir=.propel/context/iac/gcp/terraform apply -auto-approve -var-file=environments/qa/terraform.tfvars

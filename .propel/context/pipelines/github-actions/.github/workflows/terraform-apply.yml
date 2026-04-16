@@ -1,0 +1,29 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - staging
+          - prod
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - name: Terraform init
+        run: terraform -chdir=.propel/context/iac/gcp/terraform init
+      - name: Terraform apply
+        run: terraform -chdir=.propel/context/iac/gcp/terraform apply -auto-approve -var-file=environments/${{ inputs.environment }}/terraform.tfvars

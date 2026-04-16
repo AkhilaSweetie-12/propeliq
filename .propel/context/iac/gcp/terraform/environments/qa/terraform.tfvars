@@ -1,0 +1,5 @@
+project_id           = "replace-with-project-id"
+environment          = "qa"
+region               = "us-central1"
+vpc_cidr             = "10.20.0.0/24"
+service_account_name = "platform-runtime"

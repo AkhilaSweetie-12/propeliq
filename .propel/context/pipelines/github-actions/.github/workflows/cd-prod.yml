@@ -1,0 +1,15 @@
+name: Deploy Prod
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  deploy-prod:
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=.propel/context/iac/gcp/terraform init
+      - run: terraform -chdir=.propel/context/iac/gcp/terraform apply -auto-approve -var-file=environments/prod/terraform.tfvars
