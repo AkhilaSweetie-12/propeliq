@@ -296,11 +296,22 @@ jobs:
 
   iac-scan:
     name: 'Analyze: IaC Scan'
-    needs: [docker-sign]
+    needs: [infra-init]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: GCP authentication
+        uses: ./.github/workflows/shared-services/foundation/actions/gcp-auth
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Terraform init
+        working-directory: ${{ env.INFRA_DIR }}
+        run: terraform init -backend=false
 
       - name: Run tfsec
         uses: aquasecurity/tfsec-action@v1.0.3

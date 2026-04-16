@@ -7,7 +7,7 @@
 
 terraform {
   backend "gcs" {
-    bucket = ""
+    bucket = "akhila-gcp-123-493309-tfstate"
     prefix = "infra/state"
   }
 }
