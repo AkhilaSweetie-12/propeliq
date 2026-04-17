@@ -1,0 +1,9 @@
+.git
+.gitignore
+.github
+.propel
+.vscode
+.env
+*.log
+__pycache__/
+*.pyc

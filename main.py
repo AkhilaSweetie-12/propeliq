@@ -249,67 +249,67 @@ def html_response(handler: BaseHTTPRequestHandler, html: str) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-    if self.path == "/health":
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok")
-        return
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"ok")
+            return
 
-    if self.path == "/":
-        html_response(self, APP_HTML)
-        return
+        if self.path == "/":
+            html_response(self, APP_HTML)
+            return
 
-    json_response(self, 404, {"error": "not_found"})
+        json_response(self, 404, {"error": "not_found"})
 
     def do_POST(self):
-    if self.path != "/api/prompt":
-        json_response(self, 404, {"error": "not_found"})
-        return
+        if self.path != "/api/prompt":
+            json_response(self, 404, {"error": "not_found"})
+            return
 
-    content_length = int(self.headers.get("Content-Length", "0"))
-    if content_length <= 0 or content_length > 32_768:
-        json_response(self, 400, {"error": "invalid_payload"})
-        return
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length <= 0 or content_length > 32_768:
+            json_response(self, 400, {"error": "invalid_payload"})
+            return
 
-    raw = self.rfile.read(content_length)
+        raw = self.rfile.read(content_length)
 
-    try:
-        data = json.loads(raw.decode("utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        json_response(self, 400, {"error": "invalid_json"})
-        return
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            json_response(self, 400, {"error": "invalid_json"})
+            return
 
-    prompt = str(data.get("prompt", "")).strip()
-    if not prompt:
-        json_response(self, 400, {"error": "prompt_required"})
-        return
+        prompt = str(data.get("prompt", "")).strip()
+        if not prompt:
+            json_response(self, 400, {"error": "prompt_required"})
+            return
 
-    if len(prompt) > 4000:
-        json_response(self, 400, {"error": "prompt_too_long"})
-        return
+        if len(prompt) > 4000:
+            json_response(self, 400, {"error": "prompt_too_long"})
+            return
 
-    now = datetime.now(timezone.utc).isoformat()
-    reply = (
-        "Received your prompt.\n\n"
-        f"Prompt:\n{prompt}\n\n"
-        "This UI is ready for developers. Next integration step is wiring this endpoint "
-        "to your assistant backend/model service."
-    )
+        now = datetime.now(timezone.utc).isoformat()
+        reply = (
+            "Received your prompt.\n\n"
+            f"Prompt:\n{prompt}\n\n"
+            "This UI is ready for developers. Next integration step is wiring this endpoint "
+            "to your assistant backend/model service."
+        )
 
-    json_response(
-        self,
-        200,
-        {
-        "mode": "developer-ui",
-        "timestamp": now,
-        "response": reply,
-        },
-    )
+        json_response(
+            self,
+            200,
+            {
+                "mode": "developer-ui",
+                "timestamp": now,
+                "response": reply,
+            },
+        )
 
     def log_message(self, format: str, *args):
-    # Keep logs concise in Cloud Run; default logs include repeated health checks.
-    return
+        # Keep logs concise in Cloud Run; default logs include repeated health checks.
+        return
 
 
 def run() -> None:

@@ -57,6 +57,9 @@ jobs:
             echo "No tests found, skipping pytest."
           fi
 
+      - name: Check Python syntax
+        run: python -m py_compile main.py
+
       - name: Basic repo validation
         run: |
           test -f Dockerfile || (echo "Dockerfile not found" && exit 1)
